@@ -8,6 +8,7 @@ var find = require('lodash/find');
 var get = require('lodash/get');
 var forEach = require('lodash/forEach');
 var map = require('lodash/map');
+var includes = require('lodash/includes');
 var isArray = require('lodash/isArray');
 var isString = require('lodash/isString');
 var isFunction = require('lodash/isFunction');
@@ -784,8 +785,9 @@ class tgBot {
      * Send menu with reply keyboards
      * @param {Number|String} chatId - unique identifier for the message recipient
      * @param {Object} menuData - data for menu: options, keyboard, etc.
+     * @param {Function} [cb] - callback which will be executed after button callback
      */
-    sendMenu(chatId, menuData) {
+    sendMenu(chatId, menuData, cb) {
         let keyboard = this.buildKeyboard(menuData.keyboard);
         let flattenKeyboard = flattenDeep(menuData.keyboard);
 
@@ -806,25 +808,33 @@ class tgBot {
             options[key] = option;
         });
 
+        let waitForMessage = () => {
+            this.waitForMessage(chatId, ($) => {
+                let text = $.message.text;
+                let location = $.message.location;
+                let contact = $.message.contact;
+                let existedButton;
+
+                if (text) {
+                    existedButton = find(flattenKeyboard, { text: text });
+                    existedButton.callback && existedButton.callback();
+                    existedButton || waitForMessage();
+                } else if (location) {
+                    existedButton = find(flattenKeyboard, { request_location: true });
+                    callback && callback(location);
+                    existedButton.callback && existedButton.callback(location);
+                } else if (contact) {
+                    existedButton = find(flattenKeyboard, { request_contact: true });
+                    existedButton.callback && existedButton.callback(contact);
+                }
+
+                cb && existedButton && cb($);
+            });
+        }
+
         this.sendMessage(chatId, menuData.message, options);
 
-        this.waitForMessage(chatId, ($) => {
-            let text = $.message.text;
-            let location = $.message.location;
-            let contact = $.message.contact;
-            let callback;
-
-            if (text) {
-                callback = get(find(flattenKeyboard, { text: text }), 'callback');
-                callback && callback();
-            } else if (location) {
-                callback = get(find(flattenKeyboard, { request_location: true }), 'callback');
-                callback && callback(location);
-            } else if (contact) {
-                callback = get(find(flattenKeyboard, { request_contact: true }), 'callback');
-                callback && callback(contact);
-            }
-        });
+        waitForMessage();
     }
 
     /**
@@ -837,17 +847,28 @@ class tgBot {
         let i = 0;
         let result = {};
         let fields = Object.keys(formData);
-        process = process.bind(this);
 
-        function process() {
+        let process = () => {
             let key = fields[i]
             let field = formData[key];
+            let keyboard, flattenKeyboard;
+
+            if (field.keyboard) {
+                keyboard = this.buildKeyboard(field.keyboard);
+                flattenKeyboard = flattenDeep(field.keyboard);
+            }
+
+             let onError = () => {
+                field.error ? this.sendMessage(chatId, field.error, { disable_web_page_preview: true }).then(() => {
+                    process();
+                }) : process();
+            }
 
             this.sendMessage(chatId, field.q, {
                 disable_web_page_preview: true,
-                reply_markup: field.keyboard ? {
+                reply_markup: keyboard ? {
                     one_time_keyboard: true,
-                    keyboard: this.buildKeyboard(field.keyboard)
+                    keyboard: keyboard
                 } : ''
             });
 
@@ -856,7 +877,19 @@ class tgBot {
 
                 if (isValid) {
                     result[key] = $.message.text || $.message.location || $.message.contact;
-                    i++;
+
+                    if (keyboard) {
+                        let existedButtonValue = find(flattenKeyboard, { text: result[key] }) || includes(flattenKeyboard, result[key]);
+
+                        if (existedButtonValue) {
+                            i++;
+                        } else {
+                            onError();
+                            return;
+                        }
+                    } else {
+                        i++;
+                    }
 
                     if (i === fields.length) {
                         cb(result);
@@ -865,9 +898,7 @@ class tgBot {
 
                     process();
                 } else {
-                    this.sendMessage(chatId, field.error, { disable_web_page_preview: true }).then(() => {
-                        process();
-                    });
+                    onError();
                 }
             });
         }
