@@ -27,17 +27,19 @@ class tgBot {
         this._token = token;
         this._url = 'https://api.telegram.org/bot' + this._token + '/';
         this._options = options || {};
+        this._beforeUpdate = null;
         this._beforeCommand = null;
-        this._commands = {};
         this._beforeText = null;
         this._onAllText = null;
+        this._commands = {};
         this._textCommands = {};
         this._waitingCallbacks = {};
         this._callbackQueriesCallbacks = {};
         this._scopeFunctions = [
             'sendMessage', 'forwardMessage', 'sendChatAction', 'sendLocation', 'sendVenue', 'sendContact',
             'editChatMessageText', 'editChatMessageCaption', 'editChatMessageReplyMarkup',
-            'waitForMessage', 'sendMenu', 'sendForm', 'sendMessageWithInlineKeyboard'
+            'waitForMessage', 'sendMenu', 'sendForm', 'sendMessageWithInlineKeyboard', 'sendVenueWithInlineKeyboard',
+            'sendLocationWithInlineKeyboard'
         ];
 
         if (!fs.existsSync(__dirname + '/tmp')) {
@@ -92,7 +94,11 @@ class tgBot {
     _startPolling() {
         this._getUpdates().then((updates) => {
             updates.forEach((update) => {
-                this._processUpdate(update);
+                let scope = this._createScope(update);
+
+                this._beforeUpdate ?
+                    this._beforeUpdate(scope, () => this._processUpdate(update, scope)) :
+                    this._processUpdate(update, scope);
             });
         });
     }
@@ -132,15 +138,33 @@ class tgBot {
      * @return {Object}
      * @private
      */
-    _createScope(message) {
-        let scope = {
-            chatId: get(message, 'chat.id') || get(message, 'from.id'),
-            message: message,
-            user: message.from
-        };
+    _createScope(update) {
+        let msgObject, chatId, user;
+        let scope = {};
 
-        if (message.entities) {
-            scope.entities = message.entities;
+        if (update.message) {
+            scope.chatId = get(update.message, 'chat.id') || get(update.message, 'from.id');
+            scope.user = update.message.from;
+            scope.message = update.message;
+            scope.goTo = (command) => {
+                this._waitingCallbacks[scope.chatId] = null;
+                scope.message.text = command;
+                this._processMessage(scope);
+            };
+        } else if (update.callback_query) {
+            scope.chatId = get(update.callback_query, 'message.chat.id') || get(update.callback_query, 'message.from.id');
+            scope.user = update.callback_query.from;
+            scope.message = update.callback_query.message;
+            scope.answer = this.answerCallbackQuery.bind(this, update.callback_query.id);
+            scope.data = update.callback_query.data;
+            scope.clearCallback = () => {
+                delete this._callbackQueriesCallbacks[scope.user.id + ':' + scope.data];
+            };
+            scope.goTo = (command) => {
+                this._waitingCallbacks[scope.chatId] = null;
+                scope.message = { text: command };
+                this._processMessage(scope);
+            };
         }
 
         this._scopeFunctions.forEach((func) => {
@@ -151,34 +175,16 @@ class tgBot {
     }
 
     /**
-     * Create inline scope
-     * @param {Object} cbQuery - callback
-     * @return {Object}
-     * @private
-     */
-    _createInlineScope(cbQuery) {
-        cbQuery.answer = this.answerCallbackQuery.bind(this, cbQuery.id);
-        cbQuery.chatId = get(cbQuery, 'message.chat.id') || get(cbQuery, 'from.id');
-        cbQuery.user = cbQuery.from;
-        cbQuery.clearCallback = () => {
-            delete this._callbackQueriesCallbacks[cbQuery.user.id + ':' + cbQuery.data];
-        };
-
-        delete cbQuery.from;
-
-        return cbQuery;
-    }
-
-    /**
      * Process update of any kind
      * @param {Object} update - update from telegram
+     * @param {Object} scope - created scope from update
      * @private
      */
-    _processUpdate(update) {
+    _processUpdate(update, scope) {
         if (update.message) {
-            this._processMessage(update.message);
+            this._processMessage(scope);
         } else if (update.callback_query) {
-            this._processCallbackQuery(update.callback_query);
+            this._processCallbackQuery(scope);
         }
     }
 
@@ -187,9 +193,8 @@ class tgBot {
      * @param {Object} message - message from telegram
      * @private
      */
-    _processMessage(message) {
-        let text = message.text;
-        let scope = this._createScope(message);
+    _processMessage(scope) {
+        let text = scope.message.text;
 
         if (text) {
             // process message as a command
@@ -236,8 +241,7 @@ class tgBot {
      * @param {Object} cbQuery - callback query
      * @private
      */
-    _processCallbackQuery(cbQuery) {
-        let scope = this._createInlineScope(cbQuery);
+    _processCallbackQuery(scope) {
         let callback = this._callbackQueriesCallbacks[scope.user.id + ':' + scope.data];
 
         if (callback) {
@@ -415,6 +419,43 @@ class tgBot {
      * @param {Number|String} chatId - unique identifier for the message recipient
      * @param {Float} latitude - latitude of location
      * @param {Float} longitude - longitude of location
+     * @param {Object} [options] - additional telegram query options
+     * @return {Promise}
+     * @see https://core.telegram.org/bots/api#sendlocation
+     */
+    sendLocation(chatId, latitude, longitude, options) {
+        return this._api('sendLocation', this._prepareOptions(options, {
+            chat_id: chatId,
+            latitude: latitude,
+            longitude: longitude
+        }));
+    }
+
+    /**
+     * Send point on the map with inline keyboard
+     * @param {Number|String} chatId - unique identifier for the message recipient
+     * @param {Float} latitude - latitude of location
+     * @param {Float} longitude - longitude of location
+     * @param {Object} keyboard - inline keyboard
+     * @param {Object} [options] - additional telegram query options
+     * @return {Promise}
+     * @see https://core.telegram.org/bots/api#sendlocation
+     */
+    sendLocationWithInlineKeyboard(chatId, latitude, longitude, keyboard, options) {
+        options = options || {};
+
+        options.reply_markup = {
+            inline_keyboard: this.buildInlineKeyboard(chatId, keyboard)
+        };
+
+        return this.sendLocation(chatId, latitude, longitude, options);
+    }
+
+    /**
+     * Send point on the map
+     * @param {Number|String} chatId - unique identifier for the message recipient
+     * @param {Float} latitude - latitude of location
+     * @param {Float} longitude - longitude of location
      * @param {String} title - name of the venue
      * @param {String} address - address of the venue
      * @param {Object} [options] - additional telegram query options
@@ -429,6 +470,28 @@ class tgBot {
             title: title,
             address: address
         }));
+    }
+
+    /**
+     * Send point on the map with inline keyboard
+     * @param {Number|String} chatId - unique identifier for the message recipient
+     * @param {Float} latitude - latitude of location
+     * @param {Float} longitude - longitude of location
+     * @param {String} title - name of the venue
+     * @param {String} address - address of the venue
+     * @param {Object} keyboard - inline keyboard
+     * @param {Object} [options] - additional telegram query options
+     * @return {Promise}
+     * @see https://core.telegram.org/bots/api#sendvenue
+     */
+    sendVenueWithInlineKeyboard(chatId, latitude, longitude, title, address, keyboard, options) {
+        options = options || {};
+
+        options.reply_markup = {
+            inline_keyboard: this.buildInlineKeyboard(chatId, keyboard)
+        };
+
+        return this.sendVenue(chatId, latitude, longitude, title, address, options);
     }
 
     /**
@@ -667,6 +730,14 @@ class tgBot {
     }
 
     /**
+     * Add some action before update process
+     * @param {Function} cb - callback for execute command after some action
+     */
+    beforeUpdate(cb) {
+        this._beforeUpdate = cb;
+    }
+
+    /**
      * Add some action before command execution
      * @param {Function} cb - callback for execute command after some action
      */
@@ -794,7 +865,7 @@ class tgBot {
         let options = {
             reply_markup: {
                 hide_keyboard: true,
-                resize_keyboard: false,
+                resize_keyboard: true,
                 one_time_keyboard: true,
                 keyboard: keyboard
             }
@@ -821,7 +892,6 @@ class tgBot {
                     existedButton || waitForMessage();
                 } else if (location) {
                     existedButton = find(flattenKeyboard, { request_location: true });
-                    callback && callback(location);
                     existedButton.callback && existedButton.callback(location);
                 } else if (contact) {
                     existedButton = find(flattenKeyboard, { request_contact: true });
@@ -846,50 +916,85 @@ class tgBot {
     sendForm(chatId, formData, cb) {
         let i = 0;
         let result = {};
-        let fields = Object.keys(formData);
+        let fields = Object.keys(formData.fields);
+        let actions = formData.actions || {};
+
+        forEach(formData.options, (option, key) => {
+            if (key === 'reply_markup') {
+                option = assign(options[key], option);
+            }
+
+            options[key] = option;
+        });
 
         let process = () => {
             let key = fields[i]
-            let field = formData[key];
-            let keyboard, flattenKeyboard;
+            let field = formData.fields[key];
+            let keyboard, flattenKeyboard, actionButtons;
+
+            if (isFunction(field)) {
+                field = field(result);
+
+                if (!field) {
+                    i++;
+
+                    if (i === fields.length) {
+                        cb(result);
+                        return;
+                    }
+
+                    process();
+                }
+            }
 
             if (field.keyboard) {
                 keyboard = this.buildKeyboard(field.keyboard);
                 flattenKeyboard = flattenDeep(field.keyboard);
+                actionButtons = map(flattenKeyboard, (item) => {
+                    return item.action && item;
+                });
             }
 
-             let onError = () => {
+            let onError = () => {
                 field.error ? this.sendMessage(chatId, field.error, { disable_web_page_preview: true }).then(() => {
                     process();
                 }) : process();
-            }
+            };
 
-            this.sendMessage(chatId, field.q, {
+            let keyboardValidator = (text) => {
+                return find(flattenKeyboard, { text: text }) || includes(flattenKeyboard, text);
+            };
+
+            let options = {
                 disable_web_page_preview: true,
                 reply_markup: keyboard ? {
                     one_time_keyboard: true,
+                    resize_keyboard: true,
                     keyboard: keyboard
                 } : ''
-            });
+            };
+
+            if (field.options) {
+                assign(options, field.options);
+            }
+
+            this.sendMessage(chatId, field.q, options);
 
             this.waitForMessage(chatId, ($) => {
-                let isValid = field.validator ? Boolean(field.validator($.message)) : true;
+                let isValid = field.validator ? Boolean(field.validator($.message, keyboardValidator)) : true;
 
                 if (isValid) {
-                    result[key] = $.message.text || $.message.location || $.message.contact;
+                    if ($.message.text) {
+                        let actionButton = find(actionButtons, { text: $.message.text });
 
-                    if (keyboard) {
-                        let existedButtonValue = find(flattenKeyboard, { text: result[key] }) || includes(flattenKeyboard, result[key]);
-
-                        if (existedButtonValue) {
-                            i++;
-                        } else {
-                            onError();
+                        if (actionButton && actions[actionButton.action]) {
+                            actions[actionButton.action](result, cb);
                             return;
                         }
-                    } else {
-                        i++;
                     }
+
+                    result[key] = $.message.text || $.message.location || $.message.contact;
+                    i++;
 
                     if (i === fields.length) {
                         cb(result);
@@ -904,6 +1009,13 @@ class tgBot {
         }
 
         process();
+    }
+
+    goTo(scope, command) {
+        this._waitingCallbacks[scope.chatId] = null;
+        scope.message.text = command;
+
+        this._processMessage(scope);
     }
 }
 
