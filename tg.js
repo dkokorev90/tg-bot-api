@@ -10,6 +10,7 @@ var forEach = require('lodash/forEach');
 var map = require('lodash/map');
 var includes = require('lodash/includes');
 var isArray = require('lodash/isArray');
+var isRegExp = require('lodash/isRegExp');
 var isString = require('lodash/isString');
 var isFunction = require('lodash/isFunction');
 var flattenDeep = require('lodash/flattenDeep');
@@ -27,19 +28,29 @@ class tgBot {
         this._token = token;
         this._url = 'https://api.telegram.org/bot' + this._token + '/';
         this._options = options || {};
+
         this._beforeUpdate = null;
         this._beforeCommand = null;
         this._beforeText = null;
+
         this._onAllText = null;
+        this._onAllCallbackQueries = null;
+
         this._commands = {};
+
         this._textCommands = {};
-        this._waitingCallbacks = {};
+        this._textRegexpCommands = [];
+
         this._callbackQueriesCallbacks = {};
+        this._callbackQueriesRegexpCallbacks = [];
+
+        this._waitingCallbacks = {};
+
         this._scopeFunctions = [
             'sendMessage', 'forwardMessage', 'sendChatAction', 'sendLocation', 'sendVenue', 'sendContact',
             'editChatMessageText', 'editChatMessageCaption', 'editChatMessageReplyMarkup',
             'waitForMessage', 'sendMenu', 'sendForm', 'sendMessageWithInlineKeyboard', 'sendVenueWithInlineKeyboard',
-            'sendLocationWithInlineKeyboard'
+            'sendLocationWithInlineKeyboard', 'editChatMessageTextWithInlineKeyboard'
         ];
 
         if (!fs.existsSync(__dirname + '/tmp')) {
@@ -208,17 +219,10 @@ class tgBot {
                         command.callback(scope);
                 }
             } else {
-                // process message as a text
-                let textCommand = this._prepareText(text);
-
                 if (this._beforeText) {
-                    this._beforeText(scope, () => {
-                        this._onAllText && this._onAllText(scope);
-                        textCommand && textCommand(scope);
-                    });
+                    this._beforeText(scope, () => { this._processTextCommand(scope) });
                 } else {
-                    this._onAllText && this._onAllText(scope);
-                    textCommand && textCommand(scope);
+                    this._processTextCommand(scope);
                 }
             }
         }
@@ -238,16 +242,37 @@ class tgBot {
 
     /**
      * Process incoming callback query from a callback button in an inline keyboard
-     * @param {Object} cbQuery - callback query
+     * @param {Object} scope - scope
      * @private
      */
     _processCallbackQuery(scope) {
-        let callback = this._callbackQueriesCallbacks[scope.user.id + ':' + scope.data];
+        this._onAllCallbackQueries && this._onAllCallbackQueries(scope);
+        this._callbackQueriesCallbacks[scope.data] && this._callbackQueriesCallbacks[scope.data](scope);
 
-        if (callback) {
-            callback(scope);
-        } else if (this._onEmptyCallbackQuery) {
-            this._onEmptyCallbackQuery(scope);
+        if (this._callbackQueriesRegexpCallbacks.length) {
+            forEach(this._callbackQueriesRegexpCallbacks, (item) => {
+                let match = scope.data.match(item.regexp);
+                match && item.callback(scope, match);
+            });
+        }
+    }
+
+    /**
+     * Process text commands
+     * @param {Object} scope - scope
+     * @private
+     */
+    _processTextCommand(scope) {
+        let text = scope.message.text;
+
+        this._onAllText && this._onAllText(scope);
+        this._textCommands[text] && this._textCommands[text](scope);
+
+        if (this._textRegexpCommands.length) {
+            forEach(this._textRegexpCommands, (item) => {
+                let match = text.match(item.regexp);
+                match && item.callback(scope, match);
+            });
         }
     }
 
@@ -287,16 +312,6 @@ class tgBot {
         }
 
         return resCommand;
-    }
-
-    /**
-     * Prepare text command for usage
-     * @param {String} text - text from message
-     * @return {String}
-     * @private
-     */
-    _prepareText(text) {
-        return this._textCommands[text];
     }
 
     /**
@@ -542,6 +557,26 @@ class tgBot {
     }
 
     /**
+     * Edit chat text messages  with inline keyboard
+     * @param {Number|String} chatId - unique identifier for the message recipient
+     * @param {Number} messageId - unique identifier of the sent message
+     * @param {String} text - text of the message to be sent
+     * @param {Object} keyboard - inline keyboard
+     * @param {Object} [options] - additional telegram query options
+     * @return {Promise}
+     * @see https://core.telegram.org/bots/api#sendmessage
+     */
+    editChatMessageTextWithInlineKeyboard(chatId, messageId, text, keyboard, options) {
+        options = options || {};
+
+        options.reply_markup = {
+            inline_keyboard: this.buildInlineKeyboard(chatId, keyboard)
+        };
+
+        return this.editChatMessageText(chatId, messageId, text, options);
+    }
+
+    /**
      * Edit inline text messages sent via the bot
      * @param {Number} messageId - identifier of the inline message
      * @param {String} text - new text of the message
@@ -722,11 +757,28 @@ class tgBot {
             return;
         }
 
-        if (this._isCommand(text)) {
-            text = command.replace('/', '');
+        if (isString(text) && this._isCommand(text)) {
+            throw new Error('Text should not begin with a slash!');
+        } else if (isRegExp(text)) {
+            this._textRegexpCommands.push({ regexp: text, callback: cb });
+        } else {
+            this._textCommands[text] = cb;
         }
+    }
 
-        this._textCommands[text] = cb;
+    /**
+     * Add handler for callback queries
+     * @param {String} data - callback query data or callback, if function has only one parameter
+     * @param {Function} [cb] - callback
+     */
+    callbackQuery(data, cb) {
+        if (isFunction(data)) {
+            this._onAllCallbackQueries = data;
+        } else if (isRegExp(data)) {
+            this._callbackQueriesRegexpCallbacks.push({ regexp: data, callback: cb });
+        } else {
+            this._callbackQueriesCallbacks[data] = cb;
+        }
     }
 
     /**
@@ -765,15 +817,6 @@ class tgBot {
     }
 
     /**
-     * Add some action if no callbacks found for callback query
-     * @param {Function} cb - callback
-     */
-    onEmptyCallbackQuery(cb) {
-        // before command callback get two params: scope and next function
-        this._onEmptyCallbackQuery = cb;
-    }
-
-    /**
      * Build keyboard
      * @param {Object[]} items -keyboard items
      * @return {Object[]}
@@ -782,7 +825,13 @@ class tgBot {
         let keyboard = [];
 
         function getButton(btn) {
-            let button = { text: btn.text };
+            let button;
+
+            if (isString(btn)) {
+                return btn;
+            }
+
+            button = { text: btn.text };
 
             if (btn.request_location) {
                 button.request_location = true;
@@ -802,8 +851,6 @@ class tgBot {
                 });
 
                 keyboard.push(row);
-            } else if (isString(item)) {
-                keyboard.push([item]);
             } else {
                 keyboard.push([getButton(item)]);
             }
@@ -821,16 +868,13 @@ class tgBot {
         let keyboard = [];
 
         let getButton = (btn) => {
-            let rnd = Math.random().toString();
             let resBtn = { text: btn.text };
 
             if (btn.url) {
                 resBtn.url = btn.url;
-                return resBtn;
+            } else if (btn.data) {
+                resBtn.callback_data = btn.data;
             }
-
-            resBtn.callback_data = rnd;
-            this._callbackQueriesCallbacks[chatId + ':' + rnd] = btn.callback;
 
             return resBtn;
         }
@@ -865,7 +909,7 @@ class tgBot {
         let options = {
             reply_markup: {
                 hide_keyboard: true,
-                resize_keyboard: true,
+                resize_keyboard: false,
                 one_time_keyboard: true,
                 keyboard: keyboard
             }
@@ -888,8 +932,7 @@ class tgBot {
 
                 if (text) {
                     existedButton = find(flattenKeyboard, { text: text });
-                    existedButton.callback && existedButton.callback();
-                    existedButton || waitForMessage();
+                    existedButton.callback && existedButton.callback(text);
                 } else if (location) {
                     existedButton = find(flattenKeyboard, { request_location: true });
                     existedButton.callback && existedButton.callback(location);
@@ -897,6 +940,8 @@ class tgBot {
                     existedButton = find(flattenKeyboard, { request_contact: true });
                     existedButton.callback && existedButton.callback(contact);
                 }
+
+                existedButton || waitForMessage();
 
                 cb && existedButton && cb($);
             });
@@ -966,16 +1011,23 @@ class tgBot {
             };
 
             let options = {
-                disable_web_page_preview: true,
-                reply_markup: keyboard ? {
-                    one_time_keyboard: true,
-                    resize_keyboard: true,
-                    keyboard: keyboard
-                } : ''
+                disable_web_page_preview: true
             };
 
             if (field.options) {
                 assign(options, field.options);
+            }
+
+            if (keyboard) {
+                options.reply_markup = {
+                    one_time_keyboard: true,
+                    resize_keyboard: false,
+                    keyboard: keyboard
+                };
+
+                if (field.options && field.options.reply_markup) {
+                    assign(options.reply_markup, field.options.reply_markup);
+                }
             }
 
             this.sendMessage(chatId, field.q, options);
